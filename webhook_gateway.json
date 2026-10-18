@@ -1,0 +1,1016 @@
+{
+  "name": "Webhook Gateway (HMAC verification, idempotency, retries, dead-letter queue)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Webhook Gateway\nOne public endpoint that receives webhooks safely and forwards them reliably.\n\n**Ingest** `POST /webhook/gateway-ingest?source=<name>`: verifies the HMAC signature (GitHub, Stripe or generic scheme), rejects replays, stores the event once (unique source + event id) and only then answers 200. Provider retries are acknowledged as `duplicate`.\n**Delivery worker** (every minute): claims due deliveries with `FOR UPDATE SKIP LOCKED`, signs and POSTs them to each destination, retries with backoff (1 min, 5 min, 15 min, 1 h, 3 h), then marks them dead and alerts you.\n**Replay** `POST /webhook/gateway-replay {\"delivery_id\": N}` (Header Auth) puts a dead delivery back in the queue.\n**Cleanup** daily: removes delivered events after 30 days.\n\n**Before running:** run `sql/schema.sql`, insert your sources and destinations (`sql/example_sources.sql`), create credentials (Postgres, Telegram, Header Auth 'Gateway replay key'), replace `REPLACE_WITH_ALERT_CHAT_ID` and `REPLACE_ID`, set the Error Workflow to this workflow.",
+        "height": 480,
+        "width": 760,
+        "color": 4
+      },
+      "id": "7f206436-a1a6-4a91-8a36-63f8f33893ae",
+      "name": "Notes - General",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -200,
+        -420
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Why the ingest webhook has no n8n auth\nThe HMAC signature is the authentication. Unknown sources and bad signatures all get the same `401 invalid signature`, so a scanner cannot learn which sources exist. Rejections are logged (max 100 per minute).\nThe Webhook node has *Raw Body* enabled: the signature must be computed over the exact bytes received, never over re-serialized JSON.",
+        "height": 200,
+        "width": 560,
+        "color": 3
+      },
+      "id": "219b602c-5f6c-4b8e-bda4-36b0a42a894d",
+      "name": "Notes - Security",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        700,
+        -140
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "gateway-ingest",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "856c2db9-fbc5-4f09-907f-6891fba1794c",
+      "name": "Webhook Ingest",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        100
+      ],
+      "webhookId": "abb288a9-366e-4ae5-9184-e29e97cfc72c"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const item = $input.first();\nconst j = item.json || {};\nconst lower = {};\nfor (const [k, v] of Object.entries(j.headers || {})) lower[String(k).toLowerCase()] = Array.isArray(v) ? String(v[0]) : String(v);\nconst WANT = ['x-hub-signature-256', 'x-github-delivery', 'x-github-event', 'stripe-signature', 'x-signature',\n  'x-timestamp', 'x-event-id', 'x-event-type', 'content-type', 'x-forwarded-for'];\nconst headers = {};\nfor (const k of WANT) if (lower[k] !== undefined) headers[k] = lower[k].slice(0, 600);\nconst rawSource = String((j.query || {}).source || '');\nconst source_valid = /^[a-z0-9_-]{1,40}$/.test(rawSource);   // validated before any truncation\nconst source = rawSource.slice(0, 40);\nlet buf = Buffer.alloc(0);\nif (item.binary && item.binary.data) buf = await this.helpers.getBinaryDataBuffer(0, 'data');\nconst MAX_BYTES = 1000000;\nconst too_large = buf.length > MAX_BYTES;\nlet body = '', utf8_ok = true;\nif (!too_large) {\n  body = buf.toString('utf8');\n  // The signature is computed over bytes, so the stored text must round-trip exactly. NUL cannot be stored in Postgres text.\n  utf8_ok = Buffer.from(body, 'utf8').equals(buf) && !body.includes('\\u0000');\n}\nconst ip = (headers['x-forwarded-for'] || '').split(',')[0].trim().slice(0, 45);\nreturn [{ json: { source, source_valid, body, size: buf.length, too_large, utf8_ok, headers, ip } }];"
+      },
+      "id": "20fdc59c-fb4b-4918-88fd-77de0a0d1afd",
+      "name": "Prepare Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT name, scheme, secret, tolerance_seconds, enabled FROM sources WHERE name = $1::text;",
+        "options": {
+          "queryReplacement": "={{ [ $json.source_valid ? $json.source : '' ] }}"
+        }
+      },
+      "id": "0e404a28-9976-43a5-9dbd-20a8032218ce",
+      "name": "Load Source",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        520,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ---------- SHA-256 / HMAC-SHA256 in pure JavaScript (no Node built-in module needs enabling) ----------\nconst K256 = new Uint32Array([\n  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,\n  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,\n  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,\n  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,\n  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,\n  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,\n  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,\n  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);\nconst rotr = (x, n) => (x >>> n) | (x << (32 - n));\nconst sha256 = bytes => {\n  const ml = bytes.length;\n  const buf = new Uint8Array(((ml + 8) >> 6 << 6) + 64);\n  buf.set(bytes); buf[ml] = 0x80;\n  const dv = new DataView(buf.buffer);\n  dv.setUint32(buf.length - 4, (ml << 3) >>> 0);\n  dv.setUint32(buf.length - 8, Math.floor(ml / 0x20000000));\n  const H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];\n  const w = new Uint32Array(64);\n  for (let off = 0; off < buf.length; off += 64) {\n    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(off + i * 4);\n    for (let i = 16; i < 64; i++) {\n      const s0 = rotr(w[i-15], 7) ^ rotr(w[i-15], 18) ^ (w[i-15] >>> 3);\n      const s1 = rotr(w[i-2], 17) ^ rotr(w[i-2], 19) ^ (w[i-2] >>> 10);\n      w[i] = (w[i-16] + s0 + w[i-7] + s1) >>> 0;\n    }\n    let [a, b, c, d, e, f, g, h] = H;\n    for (let i = 0; i < 64; i++) {\n      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);\n      const ch = (e & f) ^ (~e & g);\n      const t1 = (h + S1 + ch + K256[i] + w[i]) >>> 0;\n      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);\n      const maj = (a & b) ^ (a & c) ^ (b & c);\n      const t2 = (S0 + maj) >>> 0;\n      h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;\n    }\n    H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;\n    H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;\n  }\n  const out = new Uint8Array(32);\n  const odv = new DataView(out.buffer);\n  H.forEach((v, i) => odv.setUint32(i * 4, v));\n  return out;\n};\nconst toBytes = s => new Uint8Array(Buffer.from(String(s), 'utf8'));\nconst hex = u8 => Array.from(u8, b => b.toString(16).padStart(2, '0')).join('');\nconst hmac256 = (keyBytes, msgBytes) => {\n  let key = keyBytes.length > 64 ? sha256(keyBytes) : keyBytes;\n  const ipad = new Uint8Array(64).fill(0x36), opad = new Uint8Array(64).fill(0x5c);\n  for (let i = 0; i < key.length; i++) { ipad[i] ^= key[i]; opad[i] ^= key[i]; }\n  const inner = sha256(Uint8Array.from([...ipad, ...msgBytes]));\n  return sha256(Uint8Array.from([...opad, ...inner]));\n};\nconst hmacHex = (secret, message) => hex(hmac256(toBytes(secret), toBytes(message)));\n// Constant-time comparison of two strings (different lengths are simply unequal)\nconst safeEq = (a, b) => {\n  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;\n  let d = 0;\n  for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);\n  return d === 0;\n};\n\nconst p = $('Prepare Request').first().json;\nconst s = $input.first().json || {};\nconst h = p.headers || {};\nconst ID_RE = /^[A-Za-z0-9_.:-]{1,100}$/;\nconst TYPE_RE = /^[A-Za-z0-9_.:-]{1,60}$/;\nconst PUBLIC = { 401: 'invalid signature', 400: 'bad request', 413: 'payload too large', 415: 'unsupported payload' };\nconst out = (status, reason) => [{ json: { ok: false, status, reason, public_error: PUBLIC[status] || 'rejected', source: p.source, ip: p.ip } }];\n\nif (p.too_large) return out(413, 'body larger than 1 MB');\nif (!p.source_valid || !s.name || s.enabled === false || !s.secret) return out(401, 'unknown or disabled source');\nconst secret = String(s.secret);\nconst tol = Math.min(86400, Math.max(30, Number(s.tolerance_seconds) || 300));\nconst nowSec = Math.floor(Date.now() / 1000);\nconst body = p.body;\nlet eventId = null, eventType = null;\n\nconst parseTs = v => /^\\d{9,13}$/.test(String(v || '').trim()) ? Number(String(v).trim()) : null;\nconst fresh = t => t !== null && Math.abs(nowSec - (t > 1e11 ? Math.floor(t / 1000) : t)) <= tol;\n\nif (s.scheme === 'github') {\n  const m = /^sha256=([0-9a-fA-F]{64})$/.exec((h['x-hub-signature-256'] || '').trim());\n  if (!m) return out(401, 'missing or malformed X-Hub-Signature-256');\n  if (!safeEq(m[1].toLowerCase(), hmacHex(secret, body))) return out(401, 'signature mismatch');\n  eventId = h['x-github-delivery'] || '';\n  eventType = h['x-github-event'] || null;\n} else if (s.scheme === 'stripe') {\n  const parts = (h['stripe-signature'] || '').split(',').map(x => x.trim()).filter(Boolean);\n  let t = null; const sigs = [];\n  for (const part of parts) {\n    const i = part.indexOf('=');\n    if (i < 0) continue;\n    const k = part.slice(0, i), v = part.slice(i + 1);\n    if (k === 't') t = parseTs(v);\n    else if (k === 'v1' && /^[0-9a-fA-F]{64}$/.test(v) && sigs.length < 5) sigs.push(v.toLowerCase());\n  }\n  if (t === null || !sigs.length) return out(401, 'missing or malformed Stripe-Signature');\n  if (!fresh(t)) return out(401, 'timestamp outside tolerance');\n  const expected = hmacHex(secret, t + '.' + body);\n  let match = false;\n  for (const sg of sigs) if (safeEq(sg, expected)) match = true;   // no early exit\n  if (!match) return out(401, 'signature mismatch');\n  try { const o = JSON.parse(body); eventId = typeof o.id === 'string' ? o.id : ''; eventType = typeof o.type === 'string' ? o.type : null; }\n  catch (e) { return out(400, 'body is not valid JSON'); }\n} else if (s.scheme === 'generic') {\n  const raw = (h['x-signature'] || '').trim().replace(/^sha256=/i, '');\n  const ts = parseTs(h['x-timestamp']);\n  if (!/^[0-9a-fA-F]{64}$/.test(raw) || ts === null) return out(401, 'missing X-Signature or X-Timestamp');\n  if (!fresh(ts)) return out(401, 'timestamp outside tolerance');\n  if (!safeEq(raw.toLowerCase(), hmacHex(secret, String(h['x-timestamp']).trim() + '.' + body))) return out(401, 'signature mismatch');\n  eventId = h['x-event-id'] || hex(sha256(toBytes(body)));   // identical bodies are treated as the same event when no id is sent\n  eventType = h['x-event-type'] || null;\n} else return out(401, 'unsupported scheme');\n\n// Signature is valid from here on, so detailed errors are safe to return\nif (!body.length) return out(400, 'empty body');\nif (!p.utf8_ok) return out(415, 'body is not valid UTF-8 text');\nif (!ID_RE.test(eventId || '')) return out(400, 'missing or invalid event id');\nif (eventType !== null && !TYPE_RE.test(eventType)) eventType = null;\nlet ct = (h['content-type'] || 'application/json').replace(/[^\\x20-\\x7e]/g, '').slice(0, 100);\nif (!/^[\\w.+-]+\\/[\\w.+-]+(\\s*;.*)?$/.test(ct)) ct = 'application/octet-stream';\nreturn [{ json: { ok: true, status: 200, source: s.name, event_id: eventId, event_type: eventType, content_type: ct, body } }];"
+      },
+      "id": "2a67c773-bfe3-428f-8a71-9d1ef3f96064",
+      "name": "Verify Signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "47e028c1-e25c-40db-9faf-af3baf094c09",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f614b7f9-2ca5-419d-846e-920b5cfc2ae4",
+      "name": "Signature OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1040,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH ev AS (\n  INSERT INTO events (source, event_id, event_type, content_type, body)\n  VALUES ($1::text, $2::text, NULLIF($3::text, ''), $4::text, $5::text)\n  ON CONFLICT (source, event_id) DO NOTHING\n  RETURNING id\n), dl AS (\n  INSERT INTO deliveries (event_id, destination_id)\n  SELECT ev.id, d.id FROM ev JOIN destinations d ON d.source = $1::text AND d.enabled\n  RETURNING id\n)\nSELECT (SELECT id FROM ev) AS event_pk,\n       (SELECT COUNT(*) FROM dl)::int AS deliveries,\n       NOT EXISTS (SELECT 1 FROM ev) AS duplicate;",
+        "options": {
+          "queryReplacement": "={{ [ $json.source, $json.event_id, $json.event_type || '', $json.content_type, $json.body ] }}"
+        }
+      },
+      "id": "5a079e73-afda-4132-8486-ad2ebba413ea",
+      "name": "Store Event",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1300,
+        20
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: $json.duplicate ? 'duplicate' : 'accepted', event: $json.event_pk, deliveries: $json.deliveries } }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "ac081995-01d5-4a4d-a1b0-33ccb366f92d",
+      "name": "Respond Accepted",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1560,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO rejections (source, reason, ip)\nSELECT left($1::text, 40), left($2::text, 120), left($3::text, 45)\nWHERE (SELECT COUNT(*) FROM rejections WHERE created_at > now() - interval '1 minute') < 100\nRETURNING id;",
+        "options": {
+          "queryReplacement": "={{ [ $json.source || '', $json.reason || '', $json.ip || '' ] }}"
+        }
+      },
+      "id": "9adb09ba-39b6-4789-8563-dc7369a3a337",
+      "name": "Log Rejection",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1300,
+        220
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'rejected', error: $('Verify Signature').first().json.public_error } }}",
+        "options": {
+          "responseCode": "={{ $('Verify Signature').first().json.status }}"
+        }
+      },
+      "id": "bac2d546-c48b-4d6f-9558-2f98f3a33573",
+      "name": "Respond Rejected",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1560,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "ce584a9b-be6d-4e05-b7e0-d4cd9d356ab3",
+      "name": "Delivery Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        560
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "7e14eef6-15e5-488f-814e-46c1662ed630",
+      "name": "Manual Delivery",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH due AS (\n  SELECT id FROM deliveries\n  WHERE (status IN ('pending', 'retrying') AND next_attempt_at <= now())\n     OR (status = 'delivering' AND locked_until < now())\n  ORDER BY next_attempt_at\n  LIMIT 20\n  FOR UPDATE SKIP LOCKED\n), upd AS (\n  UPDATE deliveries d\n  SET status = 'delivering', attempts = d.attempts + 1, locked_until = now() + interval '2 minutes'\n  FROM due WHERE d.id = due.id\n  RETURNING d.id, d.event_id, d.destination_id, d.attempts\n)\nSELECT u.id AS delivery_id, u.attempts, e.source, e.event_id, e.event_type, e.content_type, e.body,\n       dest.name AS dest_name, dest.url, dest.secret AS dest_secret\nFROM upd u\nJOIN events e ON e.id = u.event_id\nJOIN destinations dest ON dest.id = u.destination_id;",
+        "options": {}
+      },
+      "id": "6cd37b1d-9ee3-48dd-a1c4-007b218b5858",
+      "name": "Claim Deliveries",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        260,
+        640
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ---------- SHA-256 / HMAC-SHA256 in pure JavaScript (no Node built-in module needs enabling) ----------\nconst K256 = new Uint32Array([\n  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,\n  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,\n  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,\n  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,\n  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,\n  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,\n  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,\n  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);\nconst rotr = (x, n) => (x >>> n) | (x << (32 - n));\nconst sha256 = bytes => {\n  const ml = bytes.length;\n  const buf = new Uint8Array(((ml + 8) >> 6 << 6) + 64);\n  buf.set(bytes); buf[ml] = 0x80;\n  const dv = new DataView(buf.buffer);\n  dv.setUint32(buf.length - 4, (ml << 3) >>> 0);\n  dv.setUint32(buf.length - 8, Math.floor(ml / 0x20000000));\n  const H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];\n  const w = new Uint32Array(64);\n  for (let off = 0; off < buf.length; off += 64) {\n    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(off + i * 4);\n    for (let i = 16; i < 64; i++) {\n      const s0 = rotr(w[i-15], 7) ^ rotr(w[i-15], 18) ^ (w[i-15] >>> 3);\n      const s1 = rotr(w[i-2], 17) ^ rotr(w[i-2], 19) ^ (w[i-2] >>> 10);\n      w[i] = (w[i-16] + s0 + w[i-7] + s1) >>> 0;\n    }\n    let [a, b, c, d, e, f, g, h] = H;\n    for (let i = 0; i < 64; i++) {\n      const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);\n      const ch = (e & f) ^ (~e & g);\n      const t1 = (h + S1 + ch + K256[i] + w[i]) >>> 0;\n      const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);\n      const maj = (a & b) ^ (a & c) ^ (b & c);\n      const t2 = (S0 + maj) >>> 0;\n      h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;\n    }\n    H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;\n    H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;\n  }\n  const out = new Uint8Array(32);\n  const odv = new DataView(out.buffer);\n  H.forEach((v, i) => odv.setUint32(i * 4, v));\n  return out;\n};\nconst toBytes = s => new Uint8Array(Buffer.from(String(s), 'utf8'));\nconst hex = u8 => Array.from(u8, b => b.toString(16).padStart(2, '0')).join('');\nconst hmac256 = (keyBytes, msgBytes) => {\n  let key = keyBytes.length > 64 ? sha256(keyBytes) : keyBytes;\n  const ipad = new Uint8Array(64).fill(0x36), opad = new Uint8Array(64).fill(0x5c);\n  for (let i = 0; i < key.length; i++) { ipad[i] ^= key[i]; opad[i] ^= key[i]; }\n  const inner = sha256(Uint8Array.from([...ipad, ...msgBytes]));\n  return sha256(Uint8Array.from([...opad, ...inner]));\n};\nconst hmacHex = (secret, message) => hex(hmac256(toBytes(secret), toBytes(message)));\n// Constant-time comparison of two strings (different lengths are simply unequal)\nconst safeEq = (a, b) => {\n  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;\n  let d = 0;\n  for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);\n  return d === 0;\n};\n\nconst rows = $input.all().map(i => i.json).filter(r => r && r.delivery_id);\nconst ts = Math.floor(Date.now() / 1000);\nreturn rows.map(r => {\n  const body = String(r.body);\n  const headers = {\n    'User-Agent': 'n8n-webhook-gateway',\n    'X-Gateway-Source': String(r.source),\n    'X-Gateway-Event-Id': String(r.event_id),\n    'X-Gateway-Delivery': String(r.delivery_id),\n    'X-Gateway-Attempt': String(r.attempts)\n  };\n  if (r.event_type) headers['X-Gateway-Event-Type'] = String(r.event_type);\n  if (r.dest_secret) headers['X-Gateway-Signature'] = 't=' + ts + ',v1=' + hmacHex(String(r.dest_secret), ts + '.' + body);\n  return { json: { delivery_id: r.delivery_id, attempts: Number(r.attempts), url: r.url, body, content_type: r.content_type || 'application/json', headers } };\n});"
+      },
+      "id": "f0c0e818-58b9-4563-9308-5a61d1902f91",
+      "name": "Build Requests",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "specifyHeaders": "json",
+        "jsonHeaders": "={{ JSON.stringify($json.headers) }}",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "={{ $json.content_type }}",
+        "body": "={{ $json.body }}",
+        "options": {
+          "timeout": 15000,
+          "redirect": {
+            "redirect": {
+              "followRedirects": false
+            }
+          },
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          },
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 300
+            }
+          }
+        }
+      },
+      "id": "c66b39b1-a1ea-477e-b125-a3ae2582b702",
+      "name": "Deliver",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        780,
+        640
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const MAX_ATTEMPTS = 6;\nconst DELAYS = [60, 300, 900, 3600, 10800];       // seconds before attempt 2, 3, 4, 5, 6\nconst reqs = $('Build Requests').all().map(i => i.json);\nconst res = $input.all().map(i => i.json);\nconst clean = s => String(s === null || s === undefined ? '' : s).replace(/[\\u0000-\\u001f\\u007f]+/g, ' ').trim().slice(0, 200);\nreturn reqs.map((r, idx) => {\n  const x = res[idx] || {};\n  const code = Number(x.statusCode);\n  const hasCode = Number.isFinite(code) && code > 0;\n  let status, error = '', delay = 0;\n  if (hasCode && code >= 200 && code < 300) status = 'delivered';\n  else {\n    const retryable = !hasCode || code === 408 || code === 425 || code === 429 || code >= 500 || code < 200;\n    const bodyText = typeof x.body === 'string' ? x.body : '';\n    if (hasCode) error = 'HTTP ' + code + (bodyText ? ': ' + clean(bodyText) : '');\n    else { const e = x.error; error = clean(typeof e === 'string' ? e : (e && (e.message || e.description)) || 'no response'); }\n    if (!retryable) status = 'dead';                       // 3xx (redirects are not followed) and other 4xx: retrying cannot help\n    else if (r.attempts >= MAX_ATTEMPTS) status = 'dead';\n    else {\n      status = 'retrying';\n      const base = DELAYS[Math.min(Math.max(r.attempts, 1), DELAYS.length) - 1];\n      delay = Math.round(base * (0.8 + Math.random() * 0.4));\n      const ra = Number(((x.headers || {})['retry-after']));\n      if (Number.isFinite(ra) && ra > 0) delay = Math.max(delay, Math.min(Math.ceil(ra), 21600));\n    }\n  }\n  return { json: { delivery_id: r.delivery_id, status, delay_s: delay, http_status: hasCode ? code : 0, error } };\n});"
+      },
+      "id": "2bd94c35-845f-4b0b-ad36-8b45e9ccfa89",
+      "name": "Classify Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH upd AS (\n  UPDATE deliveries\n  SET status = $2::text,\n      last_status = NULLIF($3::int, 0),\n      last_error = NULLIF($4::text, ''),\n      next_attempt_at = CASE WHEN $2::text = 'retrying' THEN now() + make_interval(secs => $5::int) ELSE next_attempt_at END,\n      delivered_at = CASE WHEN $2::text = 'delivered' THEN now() ELSE delivered_at END,\n      locked_until = NULL\n  WHERE id = $1::bigint AND status = 'delivering'\n  RETURNING id, event_id, destination_id, status, attempts, last_error\n)\nSELECT u.id AS delivery_id, u.status, u.attempts, u.last_error,\n       e.source, e.event_id, e.event_type, d.name AS destination\nFROM upd u JOIN events e ON e.id = u.event_id JOIN destinations d ON d.id = u.destination_id;",
+        "options": {
+          "queryReplacement": "={{ [ $json.delivery_id, $json.status, $json.http_status, $json.error, $json.delay_s ] }}"
+        }
+      },
+      "id": "336a3297-53f0-4fc6-8535-633a5be538a1",
+      "name": "Save Result",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1300,
+        640
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b80e5708-9d31-42a0-85ed-a12a43dc2004",
+              "leftValue": "={{ $json.status === 'dead' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6c7dcc1a-c4de-4e1f-8d6f-d23593c70743",
+      "name": "Dead Delivery?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1560,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const esc = x => String(x === null || x === undefined ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst rows = $input.all().map(i => i.json).filter(r => r && r.status === 'dead');\nif (!rows.length) return [];\nconst L = ['☠️ <b>' + rows.length + ' webhook deliver' + (rows.length === 1 ? 'y' : 'ies') + ' gave up</b>', ''];\nfor (const r of rows.slice(0, 10)) {\n  L.push('#' + esc(r.delivery_id) + ' ' + esc(r.source) + ' → ' + esc(r.destination) + ' (' + esc(r.event_type || 'event') + ', ' + esc(r.attempts) + ' attempts)');\n  if (r.last_error) L.push('   ' + esc(r.last_error));\n}\nif (rows.length > 10) L.push('and ' + (rows.length - 10) + ' more');\nL.push('', 'After fixing the destination, replay with POST /webhook/gateway-replay and {\"delivery_id\": N}.');\nreturn [{ json: { text: L.join('\\n').slice(0, 3800) } }];"
+      },
+      "id": "8353e3c1-180c-4a14-bd77-cdd1e1cfb075",
+      "name": "Format Dead Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1820,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "REPLACE_WITH_ALERT_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "8452aaad-9289-4483-a586-eded913723fd",
+      "name": "Send Dead Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2080,
+        640
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ID",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "gateway-replay",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "6b3f3d68-c7f7-437b-ac5b-839946125bdb",
+      "name": "Webhook Replay",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        1100
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ID",
+          "name": "Gateway replay key"
+        }
+      },
+      "webhookId": "fe6be54a-a828-4329-8e94-f63977c6a248"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const b = ($input.first().json || {}).body;\nconst id = b && typeof b === 'object' ? b.delivery_id : undefined;\nconst n = typeof id === 'number' ? id : (typeof id === 'string' && /^\\d{1,15}$/.test(id) ? Number(id) : NaN);\nif (!Number.isSafeInteger(n) || n < 1) return [{ json: { valid: false, error: 'delivery_id must be a positive integer' } }];\nreturn [{ json: { valid: true, delivery_id: n } }];"
+      },
+      "id": "5676b3eb-4453-44ae-a12c-f2d14b37174c",
+      "name": "Parse Replay",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        1100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "394a20ff-3ff9-478c-9514-dbca6d7f02fa",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6f3e66ce-dc70-4d80-9212-aa9bded7affd",
+      "name": "Replay Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        520,
+        1100
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'rejected', error: $json.error } }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "81c5121a-d7c5-4fdb-93bd-7732801c4757",
+      "name": "Respond Bad Replay",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        780,
+        1260
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE deliveries\nSET status = 'pending', attempts = 0, next_attempt_at = now(), last_error = NULL, last_status = NULL, locked_until = NULL\nWHERE id = $1::bigint AND status = 'dead'\nRETURNING id;",
+        "options": {
+          "queryReplacement": "={{ [ $json.delivery_id ] }}"
+        }
+      },
+      "id": "a3f9e068-986a-4510-b298-e527d5af31bc",
+      "name": "Requeue Delivery",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        780,
+        1100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "d75db80d-ca5c-4ab3-b97a-9c8910337a81",
+              "leftValue": "={{ !!$json.id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c5746bfd-e3bd-4294-a8e0-832031870d4c",
+      "name": "Requeued?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1040,
+        1100
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'requeued', delivery_id: Number($json.id) } }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "18a3bf8d-0318-4126-9c80-689ba2b573e3",
+      "name": "Respond Requeued",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1300,
+        1060
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'not_found', message: 'No dead delivery with this id' } }}",
+        "options": {
+          "responseCode": 404
+        }
+      },
+      "id": "40aefee8-4dcc-4be5-be17-125025c6ff02",
+      "name": "Respond Not Found",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1300,
+        1220
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "15 3 * * *"
+            }
+          ]
+        }
+      },
+      "id": "8c6d8031-4215-4db5-9d5a-c309d2808e73",
+      "name": "Cleanup Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        1600
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH ev AS (\n  DELETE FROM events e\n  WHERE e.received_at < now() - make_interval(days => $1::int)\n    AND NOT EXISTS (\n      SELECT 1 FROM deliveries d\n      WHERE d.event_id = e.id\n        AND (d.status NOT IN ('delivered', 'dead') OR (d.status = 'dead' AND e.received_at > now() - interval '90 days')))\n  RETURNING id\n), rj AS (\n  DELETE FROM rejections WHERE created_at < now() - interval '7 days' RETURNING id\n)\nSELECT (SELECT COUNT(*) FROM ev)::int AS events_deleted, (SELECT COUNT(*) FROM rj)::int AS rejections_deleted;",
+        "options": {
+          "queryReplacement": "={{ [ 30 ] }}"
+        }
+      },
+      "id": "c9d02500-b663-4bf6-ab07-85ac27919a56",
+      "name": "Cleanup Old Data",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        260,
+        1600
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "e6f2def8-8a74-4879-a481-67f154fecb7a",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        1900
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const e = $input.first().json;\nconst wf = (e.workflow && e.workflow.name) || 'unknown workflow';\nconst node = (e.execution && e.execution.lastNodeExecuted) || 'unknown node';\nconst msg = (e.execution && e.execution.error && e.execution.error.message) || 'unknown error';\nconst url = (e.execution && e.execution.url) || '';\nreturn [{ json: { text: 'WORKFLOW ERROR\\n\\nWorkflow: ' + wf + '\\nFailed node: ' + node + '\\nError: ' + String(msg).slice(0, 500) + (url ? '\\n' + url : '') } }];"
+      },
+      "id": "64522ee1-6848-4f2c-a4f0-a4ae038b90c0",
+      "name": "Format Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        1900
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "REPLACE_WITH_ALERT_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "79a44528-abf7-4dca-b379-70f1494b3c2b",
+      "name": "Send Error Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        520,
+        1900
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ID",
+          "name": "Telegram account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook Ingest": {
+      "main": [
+        [
+          {
+            "node": "Prepare Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Request": {
+      "main": [
+        [
+          {
+            "node": "Load Source",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Source": {
+      "main": [
+        [
+          {
+            "node": "Verify Signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Signature": {
+      "main": [
+        [
+          {
+            "node": "Signature OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Signature OK?": {
+      "main": [
+        [
+          {
+            "node": "Store Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Rejection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Event": {
+      "main": [
+        [
+          {
+            "node": "Respond Accepted",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Rejection": {
+      "main": [
+        [
+          {
+            "node": "Respond Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delivery Schedule": {
+      "main": [
+        [
+          {
+            "node": "Claim Deliveries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Delivery": {
+      "main": [
+        [
+          {
+            "node": "Claim Deliveries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Deliveries": {
+      "main": [
+        [
+          {
+            "node": "Build Requests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Requests": {
+      "main": [
+        [
+          {
+            "node": "Deliver",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deliver": {
+      "main": [
+        [
+          {
+            "node": "Classify Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Results": {
+      "main": [
+        [
+          {
+            "node": "Save Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Result": {
+      "main": [
+        [
+          {
+            "node": "Dead Delivery?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dead Delivery?": {
+      "main": [
+        [
+          {
+            "node": "Format Dead Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Format Dead Alert": {
+      "main": [
+        [
+          {
+            "node": "Send Dead Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Replay": {
+      "main": [
+        [
+          {
+            "node": "Parse Replay",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Replay": {
+      "main": [
+        [
+          {
+            "node": "Replay Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Replay Valid?": {
+      "main": [
+        [
+          {
+            "node": "Requeue Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Bad Replay",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Requeue Delivery": {
+      "main": [
+        [
+          {
+            "node": "Requeued?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Requeued?": {
+      "main": [
+        [
+          {
+            "node": "Respond Requeued",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Not Found",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cleanup Schedule": {
+      "main": [
+        [
+          {
+            "node": "Cleanup Old Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Format Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Error": {
+      "main": [
+        [
+          {
+            "node": "Send Error Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Jakarta"
+  },
+  "active": false,
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
